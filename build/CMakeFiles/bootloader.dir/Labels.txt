@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/ngoc-202414649/data/Assign1/build/CMakeFiles/bootloader
+/home/ngoc-202414649/data/Assign1/build/CMakeFiles/bootloader.rule
+/home/ngoc-202414649/data/Assign1/build/CMakeFiles/bootloader-complete.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/ngoc-202414649/data/Assign1/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

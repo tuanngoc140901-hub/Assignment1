@@ -1,61 +1,94 @@
-import os
-import re
-import time
-import numpy as np
-import soundfile as sf
-import subprocess
+import socket
+import wave
+import threading
+import sys
 
-# Chờ 1 giây đảm bảo Ubuntu ghi xong file log xuống bộ nhớ đệm đĩa cứng
-time.sleep(1.0) 
+# ====================================================================
+# CẤU HÌNH IP VÀ CỔNG MẠNG (ĐỒNG BỘ VỚI ESP32)
+# ====================================================================
+HOST_IP = "0.0.0.0"      # Lắng nghe trên tất cả các card mạng của Ubuntu
+PORT_RAW = 12345         # Cổng nhận âm thanh gốc (Original)
+PORT_PROC = 12346        # Cổng nhận âm thanh đã qua lọc DSP (Processed)
 
-log_file_path = "build/esp32_output.txt"
-print("🔄 [Host PC] Đang tiến hành bóc tách dữ liệu từ file log...")
+# ĐỒNG BỘ CHUẨN TẦN SỐ VỚI BÀI LAB VÀ ESP32
+SAMPLE_RATE = 24000      
 
-if not os.path.exists(log_file_path):
-    print(f"❌ Không tìm thấy file log tại: {log_file_path}")
-    exit()
+# Biến cờ hiệu khống chế luồng ghi
+is_recording = True
 
-with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
-    content = f.read()
+def receive_stream(port, filename):
+    global is_recording
+    print(f"[*] Đang lắng nghe trên Port {port} -> Tiến trình sẽ lưu vào: {filename}")   
+    
+    # Khởi tạo Socket UDP (SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        sock.bind((HOST_IP, port))  
+    except Exception as e:
+        print(f"[!] Lỗi không thể bind Port {port}: {e}")
+        sock.close()
+        return
 
-# Tìm khối dữ liệu được kẹp giữa hai tag
-data_match = re.search(r"---START_DATA_CSV---\n(.*?)\n---END_DATA_CSV---", content, re.DOTALL)
+    # Khởi tạo cấu trúc file WAV tiêu chuẩn 16-bit Mono
+    wav_file = wave.open(filename, 'wb')
+    wav_file.setnchannels(1)      # Kênh đơn Mono
+    wav_file.setsampwidth(2)      # 16-bit PCM (2 bytes)
+    wav_file.setframerate(SAMPLE_RATE)   
+    
+    try:
+        while is_recording:
+            # Nhận gói tin UDP (Cấu hình bộ đệm 4096 bytes để thoải mái nhận khối dữ liệu)
+            data, addr = sock.recvfrom(4096)            
+            
+            # Kiểm tra gói tin Trigger kết thúc bài hát hoặc ngắt luồng
+            if data == b"EOF":
+                break               
+            
+            if data:
+                # Ghi trực tiếp mảng bytes PCM nhị phân vào file WAV
+                wav_file.writeframes(data)
+                
+    except Exception as e:
+        print(f"[!] Lỗi xảy ra trong quá trình thu luồng Port {port}: {e}")
+    finally:
+        wav_file.close()
+        sock.close()
+        print(f"[-] Đã đóng và bảo toàn file: {filename}")
 
-if not data_match:
-    print("❌ Lỗi: Không thể tìm thấy khối dữ liệu CSV âm thanh trong file log!")
-    exit()
-
-csv_lines = data_match.group(1).strip().split("\n")
-orig_signals = []
-filtered_signals = []
-
-for line in csv_lines[1:]:
-    parts = line.strip().split(",")
-    if len(parts) >= 4:
-        try:
-            orig_signals.append(int(parts[1]))
-            filtered_signals.append(int(parts[2]))
-        except ValueError:
-            continue
-
-if len(orig_signals) == 0:
-    print("❌ Dữ liệu mảng trích xuất bị rỗng!")
-    exit()
-
-# Chuẩn hóa biên độ tín hiệu về dải từ -1.0 đến 1.0 cho file WAV
-orig_array = np.array(orig_signals, dtype=np.float32) / 32767.0
-filtered_array = np.array(filtered_signals, dtype=np.float32) / 32767.0
-
-sf.write("original_signal.wav", orig_array, 24000)
-sf.write("filtered_signal.wav", filtered_array, 24000)
-
-print("✅ Trích xuất thành công: original_signal.wav và filtered_signal.wav")
-print("🚀 Đang khởi động Audacity để vẽ biểu đồ so sánh âm tần...")
-
-try:
-    # Kích hoạt Audacity chạy độc lập dưới nền để không treo terminal
-    subprocess.Popen(["audacity", "original_signal.wav", "filtered_signal.wav"], 
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("🎉 Audacity đã được mở lên màn hình!")
-except FileNotFoundError:
-    print("❌ Lỗi: Hệ thống chưa cài Audacity. Hãy gõ lệnh: sudo apt install audacity")
+if __name__ == "__main__":
+    print("=" * 60)
+    print("      HỆ THỐNG GHI ÂM THỜI GIAN THỰC QUA WI-FI (UDP SOCKET)      ")
+    print("=" * 60)
+    
+    # Khởi chạy 2 luồng song song để bắt trọn vẹn 2 cổng cùng một lúc
+    t_raw = threading.Thread(target=receive_stream, args=(PORT_RAW, "original.wav"))
+    t_proc = threading.Thread(target=receive_stream, args=(PORT_PROC, "processed.wav"))  
+    
+    t_raw.start()
+    t_proc.start()   
+    
+    try:
+        print("\n[+] HỆ THỐNG ĐANG GHI ÂM NGẦM...")
+        print("[!] Mẹo: Hãy bấm nút RESET (EN) trên ESP32 để mạch kết nối Wi-Fi và phát nhạc.")
+        input("\n==> Nhấn phím [ENTER] bất kỳ lúc nào để DỪNG thu và ĐÓNG FILE...\n")
+    except KeyboardInterrupt:
+        pass   
+    
+    # Hạ cờ hiệu ngắt vòng lặp nhận tin ở các Thread
+    is_recording = False 
+    
+    # Gửi gói tin mồi (Dummy packet) "EOF" tự gửi cho chính mình để giải phóng hàm sock.recvfrom() đang bị block
+    dummy_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        dummy_sock.sendto(b"EOF", ("127.0.0.1", PORT_RAW))
+        dummy_sock.sendto(b"EOF", ("127.0.0.1", PORT_PROC))  
+    except Exception:
+        pass
+    dummy_sock.close()
+    
+    # Đợi các luồng thu dọn tài nguyên và đóng file hoàn toàn
+    t_raw.join()
+    t_proc.join()
+    print("\n[V] THÀNH CÔNG! Cả 2 file 'original.wav' và 'processed.wav' đã được lưu an toàn.")

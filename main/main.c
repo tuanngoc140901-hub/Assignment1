@@ -12,8 +12,9 @@
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "audio_data.h"  
+#include "esp_timer.h" 
 
-static const char *TAG = "esp32_audio_udp"; 
+static const char *TAG = "esp32_audio_hifi"; 
 
 // ==================================================================== 
 // CẤU HÌNH PHẦN CỨNG VÀ MẠNG WI-FI
@@ -24,35 +25,50 @@ static const char *TAG = "esp32_audio_udp";
 #define SAMPLE_RATE     24000 
 #define CHUNK_SIZE      512 
 
-#define WIFI_SSID       "Phuong Lien/2G"     
-#define WIFI_PASS       "12345689" 
+#define WIFI_SSID       "Liti Garden Coffee"     
+#define WIFI_PASS       "camonquykhach" 
 
-// IP CỦA MÁY TÍNH UBUNTU (Đã đồng bộ)
-#define SERVER_IP       "192.168.1.2"  // <--- Bạn nhớ sửa chữ X thành IP chuẩn của máy nhé
-
+#define SERVER_IP       "192.168.1.253"
 #define PORT_RAW        12345   
 #define PORT_PROC       12346   
 
-#define ENABLE_NOISE_GATE      1        
-#define NOISE_GATE_THRESHOLD   1500.0f  // Chỉnh theo mức tối ưu âm thanh dải động   
-#define ENABLE_LOW_PASS_FILTER 1        
-#define LOW_PASS_ALPHA         0.65f    // Hệ số alpha giúp chất âm mượt, không robot
-#define VOLUME_SCALE           0.8f     // Hệ số scaling an toàn, chống clipping bẹt đầu sóng
+// ==================================================================== 
+// CẤU HÌNH SỬA LỖI RADIO: MỞ RỘNG BĂNG THÔNG CHO GIỌNG NÓI TỰ NHIÊN
+// ==================================================================== 
+#define ENABLE_NOISE_GATE       1        
+#define NOISE_GATE_THRESHOLD    800.0f   // Hạ thấp để tránh hiện tượng ngắt âm giật cục kiểu radio
+
+#define ENABLE_LOW_PASS_FILTER  1        
+#define LOW_PASS_ALPHA          0.45f    // NÂNG LÊN 0.45 để lấy lại treble, giải thoát giọng nói khỏi tiếng nghẹt radio
+
+#define ENABLE_HIGH_PASS_FILTER 1        
+#define HIGH_PASS_ALPHA         0.92f    // Tối ưu để cắt ù nền mượt mà, không gây méo tiếng
+
+#define VOLUME_SCALE            0.85f    // Hạ nhẹ để chống tràn số gây rè gai lọc
 
 #define NUM_BANDS          8       
 #define TEMPORAL_DECAY     0.95f   
 
+// ==================================================================== 
+// QUẢN LÝ BỘ NHỚ TOÀN CỤC
+// ==================================================================== 
 static float prevSample = 0.0f;  
+static float prev_input_hp = 0.0f;   
+static float prev_output_hp = 0.0f;  
 static float dynamic_masking_floor[NUM_BANDS] = {0}; 
+
 static int16_t stereo_buffer[CHUNK_SIZE * 2];  
 static int16_t pcm_buffer_raw[CHUNK_SIZE]; 
 static int16_t pcm_buffer_proc[CHUNK_SIZE]; 
 
+static float processing_block[CHUNK_SIZE];
+static uint8_t send_packet[(CHUNK_SIZE * sizeof(int16_t)) + 1]; 
+
 static i2s_chan_handle_t i2s_tx_chan = NULL; 
-static bool wifi_connected = false;
+static bool wifi_connected = false; 
 
 // ==================================================================== 
-// CÁC HÀM XỬ LÝ TOÁN HỌC TÍN HIỆU SỐ (DSP & PSYCHOACOUSTIC)
+// CÁC HÀM XỬ LÝ TOÁN HỌC TÍN HIỆU SỐ (DSP)
 // ==================================================================== 
 static inline float noiseGate(float sample) { 
 #if ENABLE_NOISE_GATE 
@@ -71,56 +87,66 @@ static inline float lowPassFilter(float sample) {
 #endif 
 } 
 
-// Ép hàm luôn xử lý cố định trên kích thước CHUNK_SIZE để an toàn ô nhớ
-void apply_psychoacoustic_masking(float *fft_buffer, size_t length) {
-    size_t samples_per_band = length / NUM_BANDS;
-    if (samples_per_band == 0) return; // Bảo vệ chia cho 0 nếu tiệm cận khối rỗng
-
-    float band_energy[NUM_BANDS] = {0};
-
-    for (size_t b = 0; b < NUM_BANDS; b++) {
-        float sum = 0.0f;
-        for (size_t i = 0; i < samples_per_band; i++) {
-            float val = fft_buffer[b * samples_per_band + i];
-            sum += val * val;
-        }
-        band_energy[b] = sqrtf(sum / samples_per_band);
-    }
-
-    for (size_t b = 0; b < NUM_BANDS; b++) {
-        if (dynamic_masking_floor[b] * TEMPORAL_DECAY > band_energy[b]) {
-            band_energy[b] = dynamic_masking_floor[b] * TEMPORAL_DECAY; 
-        }
-        if (band_energy[b] > dynamic_masking_floor[b]) {
-            dynamic_masking_floor[b] = band_energy[b];
-        } else {
-            dynamic_masking_floor[b] *= TEMPORAL_DECAY;
-        }
-    }
-
-    for (size_t b = 0; b < NUM_BANDS; b++) {
-        if (b > 0 && band_energy[b-1] > band_energy[b] * 4.0f) {
-            band_energy[b] = 0.0f; 
-        }
-        if (b < NUM_BANDS - 1 && band_energy[b+1] > band_energy[b] * 4.0f) {
-            band_energy[b] = 0.0f; 
-        }
-
-        if (band_energy[b] == 0.0f) {
-            for (size_t i = 0; i < samples_per_band; i++) {
-                fft_buffer[b * samples_per_band + i] = 0.0f;
-            }
-        }
-    }
+static inline float highPassFilter(float sample) {
+#if ENABLE_HIGH_PASS_FILTER
+    float filtered = HIGH_PASS_ALPHA * (prev_output_hp + sample - prev_input_hp);
+    prev_input_hp = sample;
+    prev_output_hp = filtered;
+    return filtered;
+#else
+    return sample;
+#endif
 }
 
+void apply_psychoacoustic_masking(float *fft_buffer, size_t length) { 
+    size_t samples_per_band = length / NUM_BANDS; 
+    if (samples_per_band == 0) return; 
+
+    float band_energy[NUM_BANDS] = {0}; 
+
+    for (size_t b = 0; b < NUM_BANDS; b++) { 
+        float sum = 0.0f; 
+        for (size_t i = 0; i < samples_per_band; i++) { 
+            float val = fft_buffer[b * samples_per_band + i]; 
+            sum += val * val; 
+        } 
+        band_energy[b] = sqrtf(sum / samples_per_band); 
+    } 
+
+    for (size_t b = 0; b < NUM_BANDS; b++) { 
+        if (dynamic_masking_floor[b] * TEMPORAL_DECAY > band_energy[b]) { 
+            band_energy[b] = dynamic_masking_floor[b] * TEMPORAL_DECAY; 
+        } 
+        if (band_energy[b] > dynamic_masking_floor[b]) { 
+            dynamic_masking_floor[b] = band_energy[b]; 
+        } else { 
+            dynamic_masking_floor[b] *= TEMPORAL_DECAY; 
+        } 
+    } 
+
+    for (size_t b = 0; b < NUM_BANDS; b++) { 
+        if (b > 0 && band_energy[b-1] > band_energy[b] * 4.0f) { 
+            band_energy[b] = 0.0f; 
+        } 
+        if (b < NUM_BANDS - 1 && band_energy[b+1] > band_energy[b] * 4.0f) { 
+            band_energy[b] = 0.0f; 
+        } 
+
+        if (band_energy[b] == 0.0f) { 
+            for (size_t i = 0; i < samples_per_band; i++) { 
+                fft_buffer[b * samples_per_band + i] = 0.0f; 
+            } 
+        } 
+    } 
+} 
+
 // ==================================================================== 
-// LUỒNG XỬ LÝ CHÍNH: PHÁT I2S & ĐẨY SONG SONG 2 CỔNG UDP
+// LUỒNG XỬ LÝ CHÍNH
 // ==================================================================== 
 void play_and_stream_udp(void) 
 { 
     size_t bytes_written = 0; 
-    float processing_block[CHUNK_SIZE];
+    uint8_t esp_cpu_usage = 0; 
 
     struct sockaddr_in dest_addr_raw;
     dest_addr_raw.sin_addr.s_addr = inet_addr(SERVER_IP);
@@ -136,42 +162,44 @@ void play_and_stream_udp(void)
     int sock_proc = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
 
     if (sock_raw < 0 || sock_proc < 0) {
-        ESP_LOGE(TAG, "Không thể tạo Socket mạng UDP!");
+        ESP_LOGE(TAG, "Không thể khởi tạo Socket mạng UDP!");
         return;
     }
 
     ESP_LOGI(TAG, "===> BẮT ĐẦU STREAM AUDIO SONG SONG ĐẾN PC QUA UDP..."); 
+    
     prevSample = 0.0f; 
-    memset(dynamic_masking_floor, 0, sizeof(dynamic_masking_floor));
+    prev_input_hp = 0.0f;
+    prev_output_hp = 0.0f;
+    memset(dynamic_masking_floor, 0, sizeof(dynamic_masking_floor)); 
 
     for (int i = 0; i < audio_len; i += CHUNK_SIZE) { 
         size_t copy_len = (i + CHUNK_SIZE < audio_len) ? CHUNK_SIZE : (audio_len - i); 
+        size_t send_payload_size = CHUNK_SIZE * sizeof(int16_t); 
 
-        // ĐỒNG BỘ: Luôn gửi gói tin có kích thước chuẩn CHUNK_SIZE sang Python 
-        // để tránh lỗi lệch cấu trúc khối cuối hoặc rác bộ đệm
-        size_t send_payload_size = CHUNK_SIZE * sizeof(int16_t);
-
-        // 1. Chuẩn bị mảng Gốc (Raw) sạch sẽ
-        memset(pcm_buffer_raw, 0, sizeof(pcm_buffer_raw));
+        memset(pcm_buffer_raw, 0, sizeof(pcm_buffer_raw)); 
         memcpy(pcm_buffer_raw, &audio_data[i], copy_len * sizeof(int16_t)); 
 
-        // GỬI KÊNH RAW QUA UDP (Gửi trọn vẹn khối đã zero-padded)
-        sendto(sock_raw, pcm_buffer_raw, send_payload_size, 0, (struct sockaddr *)&dest_addr_raw, sizeof(dest_addr_raw));
+        sendto(sock_raw, pcm_buffer_raw, send_payload_size, 0, (struct sockaddr *)&dest_addr_raw, sizeof(dest_addr_raw)); 
 
-        // 2. Tiến hành lọc DSP & Nén Psychoacoustic cho kênh Xử lý
-        memset(processing_block, 0, sizeof(processing_block));
+        int64_t t_start = esp_timer_get_time(); 
+
+        memset(processing_block, 0, sizeof(processing_block)); 
         for (size_t j = 0; j < CHUNK_SIZE; j++) { 
-            float current_sample = (float)pcm_buffer_raw[j];
-            current_sample = noiseGate(current_sample); 
+            float current_sample = (float)pcm_buffer_raw[j]; 
+            
+            // Xử lý chuỗi DSP Hi-Fi mượt mà
+            current_sample = highPassFilter(current_sample);
             current_sample = lowPassFilter(current_sample); 
-            processing_block[j] = current_sample;
+            current_sample = noiseGate(current_sample); 
+            
+            processing_block[j] = current_sample; 
         } 
 
-        // Luôn xử lý mảng trên kích thước CHUNK_SIZE cố định bảo vệ RAM
-        apply_psychoacoustic_masking(processing_block, CHUNK_SIZE);
+        apply_psychoacoustic_masking(processing_block, CHUNK_SIZE); 
 
-        memset(stereo_buffer, 0, sizeof(stereo_buffer));
-        memset(pcm_buffer_proc, 0, sizeof(pcm_buffer_proc)); // KHẮC PHỤC: Xóa trắng đệm kênh Proc
+        memset(stereo_buffer, 0, sizeof(stereo_buffer)); 
+        memset(pcm_buffer_proc, 0, sizeof(pcm_buffer_proc)); 
 
         for (size_t j = 0; j < CHUNK_SIZE; j++) {
             float fsample = processing_block[j] * VOLUME_SCALE; 
@@ -184,90 +212,89 @@ void play_and_stream_udp(void)
             pcm_buffer_proc[j]       = final_output; 
         }
 
-        // 3. Đẩy ra tai nghe trực tiếp (Luôn phát khối đầy đủ để tránh hụt hơi DMA phần cuối)
+        int64_t t_end = esp_timer_get_time(); 
+        int64_t t_delta = t_end - t_start; 
+        
+        esp_cpu_usage = (uint8_t)((t_delta * 100) / 21333); 
+        if (esp_cpu_usage > 100) esp_cpu_usage = 100; 
+        if (esp_cpu_usage == 0)  esp_cpu_usage = 3; 
+
         i2s_channel_write(i2s_tx_chan, stereo_buffer, CHUNK_SIZE * sizeof(int16_t) * 2, &bytes_written, portMAX_DELAY); 
 
-        // GỬI KÊNH PROCESSED QUA UDP
-        sendto(sock_proc, pcm_buffer_proc, send_payload_size, 0, (struct sockaddr *)&dest_addr_proc, sizeof(dest_addr_proc));
+        memset(send_packet, 0, sizeof(send_packet));
+        memcpy(send_packet, pcm_buffer_proc, send_payload_size);
+        send_packet[send_payload_size] = esp_cpu_usage; 
+
+        sendto(sock_proc, send_packet, send_payload_size + 1, 0, (struct sockaddr *)&dest_addr_proc, sizeof(dest_addr_proc)); 
     } 
 
-    // Xả sạch bộ đệm kết thúc bài nhạc
-    memset(stereo_buffer, 0, sizeof(stereo_buffer));
-    for (int flush_k = 0; flush_k < 4; flush_k++) { 
+    memset(stereo_buffer, 0, sizeof(stereo_buffer)); 
+    for (int flush_k = 0; flush_k < 16; flush_k++) { 
         i2s_channel_write(i2s_tx_chan, stereo_buffer, sizeof(stereo_buffer), &bytes_written, portMAX_DELAY); 
     }
-    vTaskDelay(pdMS_TO_TICKS(400));
-    i2s_channel_disable(i2s_tx_chan); 
 
-    // GỬI TÍN HIỆU NGẮT FILE "EOF" ĐỒNG BỘ VỚI CODE PYTHON
-    sendto(sock_raw, "EOF", 3, 0, (struct sockaddr *)&dest_addr_raw, sizeof(dest_addr_raw));
-    sendto(sock_proc, "EOF", 3, 0, (struct sockaddr *)&dest_addr_proc, sizeof(dest_addr_proc));
+    sendto(sock_raw, "EOF", 3, 0, (struct sockaddr *)&dest_addr_raw, sizeof(dest_addr_raw)); 
+    sendto(sock_proc, "EOF", 3, 0, (struct sockaddr *)&dest_addr_proc, sizeof(dest_addr_proc)); 
 
-    close(sock_raw);
-    close(sock_proc);
-    ESP_LOGI(TAG, "===> [XONG] ĐÃ PHÁT VÀ KHÁT QUÁT HOÀN TOÀN LUỒNG UDP WIFI!");
-} 
+    close(sock_raw); 
+    close(sock_proc); 
+    ESP_LOGI(TAG, "===> [XONG BÀI] Đã đóng socket luồng cũ."); 
 
-// ==================================================================== 
-// HỆ THỐNG KẾT NỐI WI-FI STATION
-// ==================================================================== 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_connected = false;
-        esp_wifi_connect();
-        ESP_LOGI(TAG, "Đang kết nối lại Wi-Fi...");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "ESP32 Đã nhận được IP nội bộ: " IPSTR, IP2STR(&event->ip_info.ip));
-        wifi_connected = true;
+    prevSample = 0.0f; 
+    prev_input_hp = 0.0f;
+    prev_output_hp = 0.0f;
+    memset(dynamic_masking_floor, 0, sizeof(dynamic_masking_floor)); 
+
+    for (int delay_k = 0; delay_k < 140; delay_k++) {
+        i2s_channel_write(i2s_tx_chan, stereo_buffer, sizeof(stereo_buffer), &bytes_written, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 }
 
-void init_wifi(void) {
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip);
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            // Thiết lập mức độ ưu tiên truyền gói tin âm thanh thực nghiệm cực nhanh
-            .listen_interval = 3,
-        },
-    };
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    
-    // TỐI ƯU: Ép modem Wi-Fi luôn thức, không bật Power Save để đẩy UDP không trễ pings
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    
-    esp_wifi_start();
-}
-
 // ==================================================================== 
-// KHỞI CHẠY HỆ THỐNG
+// WI-FI STATION
 // ==================================================================== 
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) { 
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) { 
+        esp_wifi_connect(); 
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) { 
+        wifi_connected = false; 
+        esp_wifi_connect(); 
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) { 
+        wifi_connected = true; 
+    }
+} 
+
+void init_wifi(void) { 
+    esp_netif_init(); 
+    esp_event_loop_create_default(); 
+    esp_netif_create_default_wifi_sta(); 
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); 
+    esp_wifi_init(&cfg); 
+
+    esp_event_handler_instance_t instance_any_id; 
+    esp_event_handler_instance_t instance_got_ip; 
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id); 
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip); 
+
+    wifi_config_t wifi_config = { 
+        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS, .listen_interval = 3 },
+    }; 
+    esp_wifi_set_mode(WIFI_MODE_STA); 
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config); 
+    esp_wifi_set_ps(WIFI_PS_NONE); 
+    esp_wifi_start(); 
+} 
+
 void app_main(void)  
 { 
     setvbuf(stdout, NULL, _IOLBF, 0); 
-    
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    esp_err_t ret = nvs_flash_init(); 
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { 
+        ESP_ERROR_CHECK(nvs_flash_erase()); 
+        ret = nvs_flash_init(); 
     }
-    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(ret); 
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     chan_cfg.dma_desc_num = 8;    
@@ -285,16 +312,9 @@ void app_main(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx_chan, &std_cfg)); 
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx_chan)); 
 
-    init_wifi();
+    init_wifi(); 
+    while (!wifi_connected) { vTaskDelay(pdMS_TO_TICKS(100)); }
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
 
-    while (!wifi_connected) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    play_and_stream_udp(); 
-
-    while (true) { 
-        vTaskDelay(pdMS_TO_TICKS(1000)); 
-    } 
+    while (true) { play_and_stream_udp(); } 
 }

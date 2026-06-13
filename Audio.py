@@ -1,287 +1,330 @@
 import socket
 import wave
 import threading
-import sys
-import os
-import time
+import json
 import psutil
-import struct
+import time
+import os
 from flask import Flask, render_template_string
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
 
-# ====================================================================
-# CẤU HÌNH IP VÀ CỔNG MẠNG (ĐỒNG BỘ CHUẨN VỚI ESP32)
-# ====================================================================
-HOST_IP = "0.0.0.0"      # Lắng nghe trên tất cả các card mạng của Ubuntu
-PORT_RAW = 12345         # Cổng nhận âm thanh gốc (Original)
-PORT_PROC = 12346        # Cổng nhận âm thanh đã qua lọc DSP (Processed)
-SAMPLE_RATE = 24000      # Tần số lấy mẫu đồng bộ hệ thống
-CHUNK_SIZE = 512         # Cấu trúc khối đệm
+HOST_IP = "0.0.0.0"      
+PORT_PROC = 12346        
+SAMPLE_RATE = 24000      
+
+# Định nghĩa hằng số tổng RAM ước tính khả dụng cho ứng dụng trên ESP32
+ESP32_TOTAL_RAM_KIB = 240.0
 
 app = Flask(__name__)
-# Khởi tạo SocketIO hỗ trợ truyền nhận thời gian thực
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-is_recording = True
+is_recording = False  
 stats_lock = threading.Lock()
 
-# Các biến lưu trạng thái phục vụ hiển thị thông số lý thuyết trên Dashboard
-dashboard_stats = {
-    "port_raw": PORT_RAW,
+iot_dashboard_stats = {
     "port_proc": PORT_PROC,
-    "total_raw_bytes": 0,
-    "total_proc_bytes": 0,
-    "raw_packet_count": 0,
     "proc_packet_count": 0,
-    "compression_ratio": "0.00%",
-    "noise_gate_status": "Enabled (Thresh: 1500)",
-    "lpf_status": "Enabled (Alpha 0.65)"
+    "proc_lost_packets": 0,
+    "proc_loss_rate": "0.00 %",
+    "esp_cpu": 0,
+    "esp_free_ram_kb": 0,
+    "esp_uptime_sec": 0,
+    "status": "Đang chờ kích hoạt hệ thống..."
 }
 
-def receive_stream(port, filename, stream_type):
-    global is_recording, dashboard_stats
-    print(f"[*] Đang lắng nghe trên Port {port} -> Tiến trình sẽ lưu vào: {filename}")   
+def receive_iot_stream(port, filename):
+    global is_recording, iot_dashboard_stats
     
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
     try:
         sock.bind((HOST_IP, port)) 
     except Exception as e:
-        print(f"[!] Lỗi không thể bind Port {port}: {e}")
-        sock.close()
+        print(f"[!] Lỗi khởi tạo cổng UDP: {e}")
         return
 
-    # Khởi tạo file WAV cấu hình 16-bit Mono
     wav_file = wave.open(filename, 'wb')
     wav_file.setnchannels(1)     
     wav_file.setsampwidth(2)     
     wav_file.setframerate(SAMPLE_RATE)  
     
-    packet_skip = 0
+    expected_seq = 0
+    is_first_packet = True
 
     try:
         while is_recording:
-            data, addr = sock.recvfrom(4096)           
-            
-            if data == b"EOF":
+            sock.settimeout(1.0)
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+                         
+            if not data or data == b"EOF":
+                print("[*] Đã nhận tín hiệu kết thúc luồng (EOF) từ khối I2S ESP32.")
                 break               
             
-            if data:
-                wav_file.writeframes(data)
+            if len(data) > 1028:
+                packet_seq = int.from_bytes(data[:4], byteorder='little')
                 
-                # Cập nhật thông số mạng
+                lost_count = 0
+                if not is_first_packet and packet_seq != expected_seq:
+                    diff = packet_seq - expected_seq
+                    if diff > 0:
+                        lost_count = diff
+                is_first_packet = False
+                expected_seq = packet_seq + 1
+                
+                audio_payload = data[4:1028]
+                wav_file.writeframes(audio_payload)
+                
+                try:
+                    json_str = data[1028:].decode('utf-8').strip()
+                    iot_meta = json.loads(json_str)
+                except Exception:
+                    iot_meta = {"cpu": 0, "ram": 0, "uptime": 0}
+                
                 with stats_lock:
-                    if stream_type == "RAW":
-                        dashboard_stats["total_raw_bytes"] += len(data)
-                        dashboard_stats["raw_packet_count"] += 1
-                    else:
-                        dashboard_stats["total_proc_bytes"] += len(data)
-                        dashboard_stats["proc_packet_count"] += 1
+                    iot_dashboard_stats["proc_packet_count"] += 1
+                    iot_dashboard_stats["proc_lost_packets"] += lost_count
+                    total_exp = iot_dashboard_stats["proc_packet_count"] + iot_dashboard_stats["proc_lost_packets"]
+                    iot_dashboard_stats["proc_loss_rate"] = f"{(iot_dashboard_stats['proc_lost_packets'] / total_exp * 100):.2f} %"
                     
-                    # Tính toán tỷ lệ tối ưu hóa băng thông lý thuyết 
-                    if dashboard_stats["total_raw_bytes"] > 0:
-                        ratio = (1 - (dashboard_stats["total_proc_bytes"] / dashboard_stats["total_raw_bytes"])) * 100
-                        dashboard_stats["compression_ratio"] = f"{max(0.0, ratio):.2f}%"
+                    iot_dashboard_stats["esp_cpu"] = iot_meta.get("cpu", 0)
+                    iot_dashboard_stats["esp_free_ram_kb"] = iot_meta.get("ram", 0)
+                    iot_dashboard_stats["esp_uptime_sec"] = iot_meta.get("uptime", 0)
 
-                # Trích xuất dữ liệu mẫu PCM 16-bit gửi lên giao diện đồ thị Web
-                packet_skip += 1
-                if packet_skip % 4 == 0:  # Giảm tải tần suất để đồ thị mượt hơn
-                    count = len(data) // 2
-                    if count > 0:
-                        samples = struct.unpack(f"<{count}h", data)
-                        # Lấy mẫu rút gọn khoảng 15 điểm để tối ưu hóa canvas đồ thị
-                        step = max(1, len(samples) // 15)
-                        chart_samples = [samples[k] for k in range(0, len(samples), step)]
-                        
-                        socketio.emit('wave_update', {
-                            'type': stream_type,
-                            'samples': chart_samples
-                        })
-                        
     except Exception as e:
-        print(f"[!] Lỗi xảy ra trong quá trình thu luồng Port {port}: {e}")
+        print(f"[!] Lỗi xử lý luồng mạng UDP: {e}")
     finally:
         wav_file.close()
         sock.close()
-        print(f"[-] Đã đóng và bảo toàn file: {filename}")
+        
+        is_recording = False
+        
+        print("[-] Đóng luồng thu âm thành công.")
+        with stats_lock:
+            iot_dashboard_stats["status"] = "Đã kết xuất thành công tập tin: result.wav"
+            socketio.emit('status_update', {'status': iot_dashboard_stats["status"]})
 
-# Luồng chạy ngầm liên tục đo hiệu năng CPU/RAM của Ubuntu
 def system_monitor_thread():
     while is_recording:
-        cpu = psutil.cpu_percent(interval=0.5)
-        memory = psutil.virtual_memory().percent
+        laptop_cpu = psutil.cpu_percent(interval=None)
+        virtual_mem = psutil.virtual_memory()
+        laptop_mem_used_gib = virtual_mem.used / (1024 ** 3)
+        laptop_mem_total_gib = virtual_mem.total / (1024 ** 3)
+        laptop_mem_percent = virtual_mem.percent
         
         with stats_lock:
-            stats_copy = dashboard_stats.copy()
+            stats_copy = iot_dashboard_stats.copy()
+        
+        # Kiểm tra giới hạn dữ liệu RAM trống của ESP32
+        free_ram_kib = stats_copy["esp_free_ram_kb"]
+        if free_ram_kib > ESP32_TOTAL_RAM_KIB: 
+            free_ram_kib = ESP32_TOTAL_RAM_KIB
             
-        socketio.emit('stats_update', {
-            'cpu': cpu,
-            'memory': memory,
-            'network': stats_copy
+        # Xử lý logic chặn nhảy vọt 100% khi chưa có kết nối UDP từ board ESP32
+        if stats_copy["proc_packet_count"] == 0:
+            esp_ram_used_pct = 0.0
+            esp_ram_text = "Đang chờ kết nối..."
+            esp_cpu_display = 0.0
+        else:
+            esp_ram_used_pct = ((ESP32_TOTAL_RAM_KIB - free_ram_kib) / ESP32_TOTAL_RAM_KIB) * 100.0
+            esp_ram_text = f"{free_ram_kib} / {int(ESP32_TOTAL_RAM_KIB)} KiB tự do"
+            esp_cpu_display = stats_copy["esp_cpu"]
+        
+        socketio.emit('iot_stats_update', {
+            'laptop_cpu': laptop_cpu,
+            'laptop_mem_pct': laptop_mem_percent,
+            'laptop_mem_text': f"{laptop_mem_used_gib:.1f} / {laptop_mem_total_gib:.1f} GiB",
+            'esp_cpu': esp_cpu_display,
+            'esp_ram_pct': esp_ram_used_pct, 
+            'esp_free_ram_text': esp_ram_text,
+            'esp_uptime': stats_copy["esp_uptime_sec"],
+            'packets': stats_copy["proc_packet_count"],
+            'loss_rate': stats_copy["proc_loss_rate"],
+            'status': stats_copy["status"]
         })
         time.sleep(0.5)
 
 @app.route('/')
 def index():
-    # Mã nguồn HTML tích hợp Chart.js hiển thị toàn bộ 5 yêu cầu của bài thực nghiệm
     return render_template_string("""
     <!DOCTYPE html>
     <html lang="vi">
     <head>
         <meta charset="UTF-8">
-        <title>Dashboard IoT Audio Studio</title>
+        <title>Dashboard Thu Thập Telemetry IoT Audio</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-            .header { text-align: center; margin-bottom: 25px; border-bottom: 2px solid #1e293b; padding-bottom: 15px; }
-            .header h1 { margin: 0; color: #38bdf8; font-size: 26px; font-weight: 600; }
-            .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; margin-bottom: 20px; }
-            .card { background-color: #1e293b; border-radius: 10px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); border: 1px solid #334155; }
-            .card h3 { margin-top: 0; color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 8px; font-size: 18px; }
-            .metric { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 14px; }
-            .metric span.label { color: #94a3b8; }
-            .metric span.value { font-weight: bold; color: #f8fafc; }
-            .highlight { color: #10b981 !important; }
-            .chart-container { position: relative; height: 240px; width: 100%; }
-            .status-bar { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: #065f46; color: #34d399; }
+            body { font-family: 'Segoe UI', sans-serif; background-color: #0f172a; color: #e2e8f0; padding: 20px; }
+            .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }
+            .card { background-color: #1e293b; border-radius: 10px; padding: 20px; border: 1px solid #334155; }
+            h2, h3 { color: #38bdf8; margin-top: 0; }
+            .metric { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 15px; }
+            .value { font-weight: bold; color: #f8fafc; }
+            
+            .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+            .chart-box { background-color: #1e293b; border-radius: 10px; padding: 15px; border: 1px solid #334155; height: 260px; }
+            
+            .btn-container { text-align: center; margin-bottom: 25px; }
+            .play-btn {
+                background-color: #10b981; color: white; border: none; padding: 15px 40px;
+                font-size: 18px; font-weight: bold; border-radius: 30px; cursor: pointer;
+                box-shadow: 0 4px 14px rgba(16, 185, 129, 0.4); transition: all 0.2s ease;
+            }
+            .play-btn:hover { background-color: #059669; transform: scale(1.05); }
+            .play-btn:disabled { background-color: #475569; cursor: not-allowed; box-shadow: none; }
+            #status_banner { font-size: 16px; font-weight: bold; text-align: center; color: #fbbf24; margin-bottom: 20px; }
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>HỆ THỐNG ĐO LƯỜNG & ĐÁNH GIÁ CẤU HÌNH AUDIO DSP</h1>
-            <p style="color: #64748b; margin: 5px 0 0 0;">Thiết lập phần cứng: ESP32 I2S -> Gateway Server (Ubuntu)</p>
+        <h2>TRUNG TÂM GIÁM SÁT REAL-TIME ĐỒNG BỘ & ĐO LƯỜNG SÓNG IOT EDGE</h2>
+        
+        <div class="btn-container">
+            <button class="play-btn" id="start_btn" onclick="startSystem()">▶ KÍCH HOẠT HỆ THỐNG (PLAY)</button>
         </div>
+        <div id="status_banner">Trạng thái: Đang chờ lệnh khởi động...</div>
 
         <div class="grid-container">
             <div class="card">
-                <h3>1. Port Codec Cấu Hình</h3>
-                <div class="metric"><span class="label">Giao thức truyền:</span><span class="value">UDP Unicast Socket</span></div>
-                <div class="metric"><span class="label">Cổng Audio Gốc (RAW):</span><span class="value" id="p_raw">-</span></div>
-                <div class="metric"><span class="label">Cổng DSP Lọc (PROC):</span><span class="value" id="p_proc">-</span></div>
-                <div class="metric"><span class="label">Tần số mẫu hệ thống:</span><span class="value">24000 Hz (Mono)</span></div>
-                <div class="metric"><span class="label">Độ dài khối đệm (Chunk):</span><span class="value">512 Samples</span></div>
+                <h3>1. Số Liệu Đường Truyền UDP</h3>
+                <div class="metric"><span>Cổng Mạng Lắng Nghe:</span><span class="value">12346 / UDP</span></div>
+                <div class="metric"><span>Tổng Số Gói Đã Nhận:</span><span class="value" id="pkts_lbl">0 Khối</span></div>
+                <div class="metric"><span>Tỷ Lệ Tổn Thất Gói (Loss):</span><span class="value" id="loss_lbl" style="color:#ef4444;">0.00 %</span></div>
+                <div class="metric"><span>Thời Gian Hoạt Động ESP32:</span><span class="value" id="uptime_lbl">0 s</span></div>
             </div>
-
             <div class="card">
-                <h3>2. Measure CPU / Memory</h3>
-                <div class="metric"><span class="label">Tải lượng CPU Server:</span><span class="value" id="cpu_val" style="color: #f59e0b;">0%</span></div>
-                <div class="metric"><span class="label">Chiếm dụng bộ nhớ RAM:</span><span class="value" id="mem_val">0%</span></div>
-                <div class="metric"><span class="label">Luồng mạng hoạt động:</span><span class="value"><span class="status-bar" id="net_status">LISTENING</span></span></div>
-                <div class="metric"><span class="label">Số khối nhận (Kênh Gốc):</span><span class="value" id="pkt_raw">0</span></div>
-                <div class="metric"><span class="label">Số khối nhận (Kênh Lọc):</span><span class="value" id="pkt_proc">0</span></div>
-            </div>
-
-            <div class="card">
-                <h3>3. Optimize & Evaluate Quality</h3>
-                <div class="metric"><span class="label">Noise Gate Threshold:</span><span class="value">1500.0f (Tối ưu biên độ)</span></div>
-                <div class="metric"><span class="label">Bộ lọc thấp thông (LPF):</span><span class="value">Alpha 0.65 (Mượt mà)</span></div>
-                <div class="metric"><span class="label">Psychoacoustic Masking:</span><span class="value">Active (8 Bands)</span></div>
-                <div class="metric"><span class="label" style="font-weight:bold; color:#38bdf8;">Tối ưu hóa băng thông (Optimize):</span><span class="value highlight" id="comp_ratio">0.00%</span></div>
-                <div class="metric"><span class="label" style="font-weight:bold; color:#a855f7;">Đánh giá chất lượng (SNR):</span><span class="value" id="snr_val" style="color: #a855f7;">Đang tính toán...</span></div>
+                <h3>2. Trạng Thái Tài Nguyên Tức Thời</h3>
+                <div class="metric"><span>Tải CPU Máy Tính:</span><span class="value" id="l_cpu">0.0 %</span></div>
+                <div class="metric"><span>Bộ Nhớ RAM Máy Tính:</span><span class="value" id="l_mem">0.0 GiB</span></div>
+                <div class="metric"><span>Tải CPU Node ESP32:</span><span class="value" id="e_cpu" style="color:#f43f5e;">0.0 %</span></div>
+                <div class="metric"><span>Bộ Nhớ RAM ESP32 Đang Dùng:</span><span class="value" id="e_ram" style="color:#34d399;">0.0 %</span></div>
             </div>
         </div>
 
-        <div class="card">
-            <h3>4. Real-time Test - Biểu đồ sóng âm thời gian thực (PCM Waveform)</h3>
-            <div class="chart-container">
-                <canvas id="audioChart"></canvas>
+        <div class="chart-grid">
+            <div class="chart-box">
+                <h3>3. CPU (%)</h3>
+                <canvas id="laptopCpuChart"></canvas>
+            </div>
+            <div class="chart-box">
+                <h3>4. CPU ESP32(%)</h3>
+                <canvas id="espCpuChart"></canvas>
+            </div>
+            <div class="chart-box">
+                <h3>5. RAM MÁY TÍNH (%)</h3>
+                <canvas id="laptopRamChart"></canvas>
+            </div>
+            <div class="chart-box">
+                <h3>6. RAM ESP-32 (%)</h3>
+                <canvas id="espRamChart"></canvas>
             </div>
         </div>
 
         <script>
             var socket = io();
+            var tickCounter = 0;
             
-            // Khởi tạo đồ thị sóng đôi bằng Chart.js
-            var ctx = document.getElementById('audioChart').getContext('2d');
-            var audioChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: Array.from({length: 15}, (_, i) => i + 1),
-                    datasets: [
-                        { label: 'Âm thanh gốc (RAW)', data: Array(15).fill(0), borderColor: '#38bdf8', borderWidth: 2, tension: 0.2, pointRadius: 0 },
-                        { label: 'Đã qua xử lý lọc (PROCESSED)', data: Array(15).fill(0), borderColor: '#10b981', borderWidth: 2, tension: 0.2, pointRadius: 0 }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    scales: {
-                        y: { min: -25000, max: 25000, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
-                        x: { display: false }
-                    },
-                    plugins: { legend: { labels: { color: '#e2e8f0' } } }
+            function startSystem() {
+                document.getElementById('start_btn').disabled = true;
+                document.getElementById('start_btn').innerText = "🔊 ĐANG THU DỮ LIỆU...";
+                socket.emit('trigger_play');
+            }
+
+            function createChartConfig(label, color, yTitle, yMin, yMax) {
+                return {
+                    type: 'line',
+                    data: { labels: [], datasets: [{ label: label, borderColor: color, data: [], tension: 0.15, fill: false }] },
+                    options: {
+                        responsive: true, maintainAspectRatio: false,
+                        scales: {
+                            x: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
+                            y: { min: yMin, max: yMax, title: { display: true, text: yTitle, color: '#e2e8f0' }, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } }
+                        },
+                        plugins: { legend: { labels: { color: '#e2e8f0' } } }
+                    }
+                };
+            }
+
+            // Đồng bộ toàn bộ 4 thang đo về phạm vi cố định 0 - 100% để giao diện đồng nhất, cân xứng
+            var lCpuChart = new Chart(document.getElementById('laptopCpuChart').getContext('2d'), createChartConfig('CPU Laptop (%)', '#38bdf8', 'Mức sử dụng (%)', 0, 100));
+            var eCpuChart = new Chart(document.getElementById('espCpuChart').getContext('2d'), createChartConfig('CPU ESP32 (%)', '#f43f5e', 'Mức sử dụng (%)', 0, 100));
+            var lRamChart = new Chart(document.getElementById('laptopRamChart').getContext('2d'), createChartConfig('RAM Laptop (%)', '#fbbf24', 'Tỷ lệ sử dụng (%)', 0, 100));
+            var eRamChart = new Chart(document.getElementById('espRamChart').getContext('2d'), createChartConfig('RAM ESP32 (%)', '#10b981', 'Tỷ lệ sử dụng (%)', 0, 100));
+
+            socket.on('iot_stats_update', function(data) {
+                document.getElementById('status_banner').innerText = "Trạng thái: " + data.status;
+                document.getElementById('l_cpu').innerText = data.laptop_cpu.toFixed(1) + " %";
+                document.getElementById('l_mem').innerText = data.laptop_mem_text; // Sửa lỗi gọi biến laptop_text cũ
+                document.getElementById('e_cpu').innerText = data.esp_cpu.toFixed(1) + " %";
+                
+                // Hiển thị phần trăm sử dụng kèm chú thích dung lượng thô ở giao diện card số 2
+                if (data.packets === 0) {
+                    document.getElementById('e_ram').innerText = "0.0 % (" + data.esp_free_ram_text + ")";
+                } else {
+                    document.getElementById('e_ram').innerText = data.esp_ram_pct.toFixed(1) + " % (" + data.esp_free_ram_text + ")";
                 }
+                
+                document.getElementById('pkts_lbl').innerText = data.packets + " Khối";
+                document.getElementById('loss_lbl').innerText = data.loss_rate;
+                document.getElementById('uptime_lbl').innerText = data.esp_uptime + " s";
+
+                tickCounter += 0.5;
+                var timeLabel = tickCounter.toFixed(1) + " s";
+                
+                [lCpuChart, eCpuChart, lRamChart, eRamChart].forEach(function(chart) {
+                    chart.data.labels.push(timeLabel);
+                    if(chart.data.labels.length > 30) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+                });
+
+                lCpuChart.data.datasets[0].data.push(data.laptop_cpu);
+                eCpuChart.data.datasets[0].data.push(data.esp_cpu);
+                lRamChart.data.datasets[0].data.push(data.laptop_mem_pct);
+                eRamChart.data.datasets[0].data.push(data.esp_ram_pct);
+
+                lCpuChart.update(); eCpuChart.update(); lRamChart.update(); eRamChart.update();
             });
 
-            // Lắng nghe cập nhật tài nguyên và thông số
-            socket.on('stats_update', function(data) {
-                document.getElementById('cpu_val').innerText = data.cpu + "%";
-                document.getElementById('mem_val').innerText = data.memory + "%";
-                
-                document.getElementById('p_raw').innerText = data.network.port_raw;
-                document.getElementById('p_proc').innerText = data.network.port_proc;
-                document.getElementById('pkt_raw').innerText = data.network.raw_packet_count;
-                document.getElementById('pkt_proc').innerText = data.network.proc_packet_count;
-                document.getElementById('comp_ratio').innerText = data.network.compression_ratio;
-                
-                if (data.network.proc_packet_count > 10) {
-                    document.getElementById('net_status').innerText = "RECEIVING";
-                    document.getElementById('net_status').style.backgroundColor = "#1e3a8a";
-                    // Đánh giá tỷ lệ chất lượng thực nghiệm dựa vào suy hao nhiễu nền của Noise Gate
-                    document.getElementById('snr_val').innerText = "~ 64.21 dB (Tín hiệu sạch)";
+            socket.on('status_update', function(data) {
+                document.getElementById('status_banner').innerText = "Trạng thái: " + data.status;
+                if(data.status.includes("thành công")) {
+                    document.getElementById('start_btn').innerText = "▶ KHỞI CHẠY LẠI (PLAY)";
+                    document.getElementById('start_btn').disabled = false;
                 }
-            });
-
-            // Đẩy trực tiếp mảng số PCM từ mạng lên các đường đồ thị
-            socket.on('wave_update', function(data) {
-                if (data.type === 'RAW') {
-                    audioChart.data.datasets[0].data = data.samples;
-                } else if (data.type === 'PROC') {
-                    audioChart.data.datasets[1].data = data.samples;
-                }
-                audioChart.update('none'); // Update chế độ siêu nhanh không dùng animation
             });
         </script>
     </body>
     </html>
     """)
 
+@socketio.on('trigger_play')
+def handle_trigger_play():
+    global is_recording, iot_dashboard_stats
+    if not is_recording:
+        is_recording = True
+        
+        with stats_lock:
+            iot_dashboard_stats["proc_packet_count"] = 0
+            iot_dashboard_stats["proc_lost_packets"] = 0
+            iot_dashboard_stats["proc_loss_rate"] = "0.00 %"
+            iot_dashboard_stats["status"] = "Đường truyền đang mở... Hãy bật / reset board ESP32!"
+            
+        t_proc = threading.Thread(target=receive_iot_stream, args=(PORT_PROC, "result.wav"))  
+        t_monitor = threading.Thread(target=system_monitor_thread)
+        t_proc.start()   
+        t_monitor.start()
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("   KHỞI CHẠY LỚP CỔNG GATEWAY ĐO LƯỜNG ĐA NHIỆM CHO DỰ ÁN AUDIO   ")
+    print("      KHỞI CHẠY GATEWAY ĐIỀU KHIỂN ĐỒNG BỘ CẢM BIẾN AUDIO     ")
     print("=" * 60)
-    
-    # Khởi chạy luồng thu UDP đồng thời
-    t_raw = threading.Thread(target=receive_stream, args=(PORT_RAW, "original.wav", "RAW"))
-    t_proc = threading.Thread(target=receive_stream, args=(PORT_PROC, "processed.wav", "PROC"))  
-    t_monitor = threading.Thread(target=system_monitor_thread)
-    
-    t_raw.start()
-    t_proc.start()   
-    t_monitor.start()
-    
-    print("\n[+] Web Server thực nghiệm đang chạy.")
-    print("[+] Hãy truy cập trực tiếp bằng IP: http://192.168.1.253:5000")
+    print("[+] Đang mở Dashboard đo lường tại địa chỉ: http://localhost:5000")
     
     try:
-        # Chạy máy chủ Web tích hợp socket thông qua thư viện luồng eventlet
         socketio.run(app, host="0.0.0.0", port=5000, log_output=False)
     except KeyboardInterrupt:
         pass
         
     is_recording = False
-    
-    # Gói tin mồi (Dummy packet) tự giải phóng khối hàm block socket
-    dummy_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        dummy_sock.sendto(b"EOF", ("127.0.0.1", PORT_RAW))
-        dummy_sock.sendto(b"EOF", ("127.0.0.1", PORT_PROC))  
-    except Exception:
-        pass
-    dummy_sock.close()
-    
-    t_raw.join()
-    t_proc.join()
-    print("\n[V] ĐÃ ĐÓNG SERVER AN TOÀN.")
+    print("\n[V] Đã đóng máy chủ xử lý an toàn.")
